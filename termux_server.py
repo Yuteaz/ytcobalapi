@@ -10,8 +10,11 @@ import yt_dlp
 
 from yt_core import (
     BackendError,
+    get_job_status,
     get_video_info,
+    pop_job_file,
     prepare_download,
+    start_download_job,
     verify_internal_secret,
 )
 
@@ -37,6 +40,29 @@ class TermuxHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _stream_file(self, tmpdir: str, output_path: str, filename: str, media_type: str):
+        try:
+            size = os.path.getsize(output_path)
+            ascii_name = filename.encode("ascii", "ignore").decode("ascii") or "video"
+
+            self.send_response(200)
+            self._send_cors()
+            self.send_header("Content-Type", media_type)
+            self.send_header("Content-Length", str(size))
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}",
+            )
+            self.end_headers()
+
+            with open(output_path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile, length=256 * 1024)
+        except BrokenPipeError:
+            pass
+        finally:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
     def do_OPTIONS(self):
         self.send_response(204)
         self._send_cors()
@@ -60,6 +86,40 @@ class TermuxHandler(BaseHTTPRequestHandler):
             except BackendError as err:
                 return self._send_json(err.status_code, {"detail": err.detail})
 
+        if parsed.path == "/start":
+            url = (qs.get("url") or [""])[0]
+            quality = (qs.get("quality") or ["1080"])[0]
+            fmt = (qs.get("format") or ["mp4"])[0]
+            try:
+                exp = int((qs.get("exp") or ["0"])[0])
+            except ValueError:
+                exp = 0
+            sig = (qs.get("sig") or [""])[0]
+
+            try:
+                job = start_download_job(url, quality, fmt, exp, sig)
+                return self._send_json(200, job)
+            except BackendError as err:
+                return self._send_json(err.status_code, {"detail": err.detail})
+
+        if parsed.path == "/status":
+            job_id = (qs.get("job") or [""])[0]
+            token = (qs.get("token") or [""])[0]
+            try:
+                return self._send_json(200, get_job_status(job_id, token))
+            except BackendError as err:
+                return self._send_json(err.status_code, {"detail": err.detail})
+
+        if parsed.path == "/file":
+            job_id = (qs.get("job") or [""])[0]
+            token = (qs.get("token") or [""])[0]
+            try:
+                tmpdir, output_path, filename, media_type = pop_job_file(job_id, token)
+            except BackendError as err:
+                return self._send_json(err.status_code, {"detail": err.detail})
+            self._stream_file(tmpdir, output_path, filename, media_type)
+            return
+
         if parsed.path == "/download":
             url = (qs.get("url") or [""])[0]
             quality = (qs.get("quality") or ["1080"])[0]
@@ -70,31 +130,11 @@ class TermuxHandler(BaseHTTPRequestHandler):
                 exp = 0
             sig = (qs.get("sig") or [""])[0]
 
-            tmpdir = None
             try:
                 tmpdir, output_path, filename, media_type = prepare_download(url, quality, fmt, exp, sig)
-                size = os.path.getsize(output_path)
-                ascii_name = filename.encode("ascii", "ignore").decode("ascii") or "video"
-
-                self.send_response(200)
-                self._send_cors()
-                self.send_header("Content-Type", media_type)
-                self.send_header("Content-Length", str(size))
-                self.send_header(
-                    "Content-Disposition",
-                    f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}",
-                )
-                self.end_headers()
-
-                with open(output_path, "rb") as f:
-                    shutil.copyfileobj(f, self.wfile, length=256 * 1024)
             except BackendError as err:
                 return self._send_json(err.status_code, {"detail": err.detail})
-            except BrokenPipeError:
-                pass
-            finally:
-                if tmpdir:
-                    shutil.rmtree(tmpdir, ignore_errors=True)
+            self._stream_file(tmpdir, output_path, filename, media_type)
             return
 
         self._send_json(404, {"detail": "Not found"})
