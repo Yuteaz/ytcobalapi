@@ -8,12 +8,14 @@ import shutil
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import yt_dlp
 
 BACKEND_SECRET = os.getenv("BACKEND_SECRET", "").strip()
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "3600"))
+MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "2")))
+MAX_QUEUE_SIZE = max(1, int(os.getenv("MAX_QUEUE_SIZE", "12")))
 YT_ID_PATTERN = re.compile(
     r"(?:v=|youtu\.be/|youtube\.com/(?:shorts|embed|live)/)([a-zA-Z0-9_-]{11})"
 )
@@ -21,7 +23,9 @@ COOKIES_PATH = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
 
 _INFO_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _JOBS: Dict[str, Dict[str, Any]] = {}
+_WAIT_QUEUE: List[str] = []
 _JOBS_LOCK = threading.Lock()
+_DOWNLOAD_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_JOBS)
 JOB_TTL_SECONDS = 600
 
 
@@ -142,6 +146,8 @@ def get_video_info(url: str) -> Dict[str, Any]:
         "maxResThumbnail": f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
         "formats": formats,
     }
+    if len(_INFO_CACHE) >= 200:
+        _INFO_CACHE.clear()
     _INFO_CACHE[video_id] = (now + 600, payload)
     return payload
 
@@ -277,6 +283,8 @@ def _cleanup_expired_jobs() -> None:
         expired = [jid for jid, job in _JOBS.items() if job.get("expires", 0) < now]
         for jid in expired:
             job = _JOBS.pop(jid, None)
+            if jid in _WAIT_QUEUE:
+                _WAIT_QUEUE.remove(jid)
             if job and job.get("tmpdir"):
                 shutil.rmtree(job["tmpdir"], ignore_errors=True)
 
@@ -296,9 +304,16 @@ def start_download_job(url: str, quality: str, fmt: str, exp: int, sig: str) -> 
     token = secrets.token_urlsafe(16)
 
     with _JOBS_LOCK:
+        active_or_queued = sum(
+            1 for j in _JOBS.values() if j["state"] in ("queued", "starting", "downloading", "merging")
+        )
+        if active_or_queued >= MAX_CONCURRENT_JOBS + MAX_QUEUE_SIZE:
+            raise BackendError(429, "Server busy — queue is full. Please try again in a moment.")
+
+        _WAIT_QUEUE.append(job_id)
         _JOBS[job_id] = {
             "token": token,
-            "state": "starting",
+            "state": "queued",
             "percent": 0,
             "speed": "",
             "error": None,
@@ -320,7 +335,17 @@ def start_download_job(url: str, quality: str, fmt: str, exp: int, sig: str) -> 
                     job["speed"] = info["speed"]
 
     def worker() -> None:
+        _DOWNLOAD_SEMAPHORE.acquire()
         try:
+            with _JOBS_LOCK:
+                if job_id in _WAIT_QUEUE:
+                    _WAIT_QUEUE.remove(job_id)
+                job = _JOBS.get(job_id)
+                if not job:
+                    return
+                job["state"] = "starting"
+                job["expires"] = time.time() + JOB_TTL_SECONDS
+
             tmpdir, output_path, filename, media_type = prepare_download(
                 url, quality, fmt_clean, exp, sig, progress_cb=update_progress
             )
@@ -339,16 +364,22 @@ def start_download_job(url: str, quality: str, fmt: str, exp: int, sig: str) -> 
                     shutil.rmtree(tmpdir, ignore_errors=True)
         except BackendError as err:
             with _JOBS_LOCK:
+                if job_id in _WAIT_QUEUE:
+                    _WAIT_QUEUE.remove(job_id)
                 job = _JOBS.get(job_id)
                 if job:
                     job["state"] = "error"
                     job["error"] = err.detail
         except Exception as exc:
             with _JOBS_LOCK:
+                if job_id in _WAIT_QUEUE:
+                    _WAIT_QUEUE.remove(job_id)
                 job = _JOBS.get(job_id)
                 if job:
                     job["state"] = "error"
                     job["error"] = str(exc)
+        finally:
+            _DOWNLOAD_SEMAPHORE.release()
 
     threading.Thread(target=worker, daemon=True).start()
     return {"jobId": job_id, "token": token}
@@ -360,8 +391,10 @@ def get_job_status(job_id: str, token: str) -> Dict[str, Any]:
         job = _JOBS.get(job_id)
         if not job or not hmac.compare_digest(job["token"], token or ""):
             raise BackendError(404, "Job not found or expired.")
+        q_pos = (_WAIT_QUEUE.index(job_id) + 1) if job_id in _WAIT_QUEUE else 0
         return {
             "state": job["state"],
+            "queuePosition": q_pos,
             "percent": job["percent"],
             "speed": job["speed"],
             "error": job["error"],
