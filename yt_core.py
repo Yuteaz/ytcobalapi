@@ -51,7 +51,44 @@ def init_cookies_file() -> Optional[str]:
         with open(COOKIES_PATH, "w", encoding="utf-8") as f:
             f.write(raw_txt)
         return COOKIES_PATH
-    return COOKIES_PATH if os.path.exists(COOKIES_PATH) else None
+
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt"),
+        os.path.join(os.path.expanduser("~"), "cookies.txt"),
+        COOKIES_PATH,
+    ]
+    for path in candidates:
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+    return None
+
+
+def _extract_with_fallback(clean_url: str, base_opts: Dict[str, Any], download: bool) -> Any:
+    cookiefile = init_cookies_file()
+    opts = dict(base_opts)
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(clean_url, download=download)
+    except Exception as exc:
+        msg = str(exc).lower()
+        is_bot_check = "not a bot" in msg or "sign in to confirm" in msg
+        if is_bot_check and not cookiefile:
+            retry_opts = dict(opts)
+            retry_opts["extractor_args"] = {"youtube": {"player_client": ["android_vr", "tv", "ios"]}}
+            try:
+                with yt_dlp.YoutubeDL(retry_opts) as ydl:
+                    return ydl.extract_info(clean_url, download=download)
+            except Exception as retry_exc:
+                retry_msg = str(retry_exc)
+                if "not a bot" in retry_msg.lower() or "sign in to confirm" in retry_msg.lower():
+                    raise RuntimeError(
+                        "YouTube requested bot verification. Run `pip install -U yt-dlp bgutil-ytdlp-pot-provider` in Termux or save a throwaway cookies.txt at ~/yt-backend/cookies.txt."
+                    ) from retry_exc
+                raise retry_exc
+        raise
 
 
 def extract_video_id(url: str) -> str:
@@ -98,13 +135,9 @@ def get_video_info(url: str) -> Dict[str, Any]:
         "noplaylist": True,
         "skip_download": True,
     }
-    cookiefile = init_cookies_file()
-    if cookiefile:
-        ydl_opts["cookiefile"] = cookiefile
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(clean_url, download=False)
+        info = _extract_with_fallback(clean_url, ydl_opts, download=False)
     except Exception as exc:
         raise BackendError(422, f"Failed to extract video info: {exc}")
 
@@ -217,10 +250,6 @@ def prepare_download(
         "postprocessor_hooks": [on_postprocess],
     }
 
-    cookiefile = init_cookies_file()
-    if cookiefile:
-        ydl_opts["cookiefile"] = cookiefile
-
     if fmt == "m4a":
         # Direct M4A copy: zero transcoding overhead on mobile CPUs
         ydl_opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
@@ -247,8 +276,7 @@ def prepare_download(
         ydl_opts["merge_output_format"] = "mp4"
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(clean_url, download=True)
+        info = _extract_with_fallback(clean_url, ydl_opts, download=True)
     except BackendError:
         cleanup()
         raise
