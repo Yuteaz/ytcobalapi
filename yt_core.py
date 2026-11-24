@@ -63,9 +63,16 @@ def init_cookies_file() -> Optional[str]:
     return None
 
 
+def _strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text or "").strip()
+
+
 def _extract_with_fallback(clean_url: str, base_opts: Dict[str, Any], download: bool) -> Any:
     cookiefile = init_cookies_file()
     opts = dict(base_opts)
+    opts.setdefault("js_runtimes", {"deno": {"path": None}, "node": {"path": None}})
+    opts.setdefault("remote_components", ["ejs:github"])
+    opts.setdefault("color", {"stdout": "never", "stderr": "never"})
     if cookiefile:
         opts["cookiefile"] = cookiefile
 
@@ -73,22 +80,28 @@ def _extract_with_fallback(clean_url: str, base_opts: Dict[str, Any], download: 
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(clean_url, download=download)
     except Exception as exc:
-        msg = str(exc).lower()
-        is_bot_check = "not a bot" in msg or "sign in to confirm" in msg
-        if is_bot_check and not cookiefile:
+        msg = _strip_ansi(str(exc))
+        lower = msg.lower()
+        is_bot_check = "not a bot" in lower or "sign in to confirm" in lower
+        is_format_err = "requested format is not available" in lower
+
+        if (is_bot_check and not cookiefile) or is_format_err:
             retry_opts = dict(opts)
-            retry_opts["extractor_args"] = {"youtube": {"player_client": ["android_vr", "tv", "ios"]}}
+            if is_format_err and cookiefile:
+                # Some authenticated web clients restrict formats without PO tokens; fallback to android_vr/tv
+                retry_opts.pop("cookiefile", None)
+            retry_opts["extractor_args"] = {"youtube": {"player_client": ["android_vr", "tv", "ios", "web_safari"]}}
             try:
                 with yt_dlp.YoutubeDL(retry_opts) as ydl:
                     return ydl.extract_info(clean_url, download=download)
             except Exception as retry_exc:
-                retry_msg = str(retry_exc)
+                retry_msg = _strip_ansi(str(retry_exc))
                 if "not a bot" in retry_msg.lower() or "sign in to confirm" in retry_msg.lower():
                     raise RuntimeError(
-                        "YouTube requested bot verification. Run `pip install -U yt-dlp bgutil-ytdlp-pot-provider` in Termux or save a throwaway cookies.txt at ~/yt-backend/cookies.txt."
+                        "YouTube requested bot verification. Update cookies.txt at ~/yt-backend/cookies.txt or run `pip install -U \"yt-dlp[default]\"` in Termux."
                     ) from retry_exc
-                raise retry_exc
-        raise
+                raise RuntimeError(retry_msg) from retry_exc
+        raise RuntimeError(msg) from exc
 
 
 def extract_video_id(url: str) -> str:
