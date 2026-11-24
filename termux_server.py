@@ -68,6 +68,11 @@ class TermuxHandler(BaseHTTPRequestHandler):
         self._send_cors()
         self.end_headers()
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self._send_cors()
+        self.end_headers()
+
     def do_GET(self):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
